@@ -94,7 +94,46 @@ try{const saved=JSON.parse(localStorage.getItem('cf_rate_defaults')||'{}');if(sa
 ['s_rate','rulePreset'].forEach(id=>$(id).addEventListener('change',()=>{localStorage.setItem('cf_rate_defaults',JSON.stringify({rate:$('s_rate').value,rule:$('rulePreset').value}))}));
 let cfQuoteText='';
 async function loadQuoteLoans(){if(!sb||!session)return;const [{data:l,error:e1},{data:s,error:e2},{data:p,error:e3}]=await Promise.all([sb.from('cf_loans').select('*'),sb.from('cf_simulations').select('*'),sb.from('cf_payments').select('*')]);if(e1||e2||e3){msg('Não foi possível carregar operações: '+(e1||e2||e3).message,true);return}loans=l||[];simulations=s||[];payments=p||[];const sel=$('q_loan'),prev=sel.value;sel.innerHTML='<option value="">Selecione um empréstimo</option>'+loans.map(l=>{const c=clients.find(x=>x.id===l.client_id);return `<option value="${esc(l.id)}">${esc(c?.nome||'Cliente')} — ${money(l.total)}</option>`}).join('');sel.value=prev;$('q_date').value||=new Date().toLocaleDateString('en-CA');}
-$('q_calculate').onclick=()=>{try{const loan=loans.find(l=>l.id===$('q_loan').value);if(!loan)throw Error('Selecione um empréstimo.');const sim=simulations.find(s=>s.id===loan.simulation_id);if(!sim)throw Error('Simulação original não encontrada.');if(sim.period_count!==1)throw Error('Por segurança, a previsão por data está disponível inicialmente para empréstimos de pagamento único.');const date=$('q_date').value;if(!date)throw Error('Informe a data.');const originalDue=sim.first_due;const start=cfAddDays(originalDue,-30);const days=cfDays(start,date);if(days<0)throw Error('A data é anterior ao início estimado do período.');const rate=Number(sim.monthly_rate),principal=Number(sim.principal),rule=$('q_rule').value;const paid=payments.filter(p=>p.loan_id===loan.id).reduce((t,p)=>t+Number(p.amount),0);if(paid>0)throw Error('Esta operação já tem recebimentos. Para evitar cálculo incorreto, o recálculo de juros e amortizações após pagamentos anteriores precisa da atualização transacional do banco.');const baseInterest=cfInterest(principal,rate,Math.min(days,30),rule);const dueTotal=cfRound(principal+cfInterest(principal,rate,30,rule));const overdue=days>30?cfRound(dueTotal*rate/100*(days-30)/30):0;const interest=cfRound(baseInterest+overdue),total=cfRound(principal+interest);const amount=Number($('q_amount').value||0);if(!Number.isFinite(amount)||amount<0||amount>total)throw Error('Informe pagamento entre zero e o valor previsto.');const towardInterest=cfRound(Math.min(amount,interest)),towardPrincipal=cfRound(Math.max(0,amount-towardInterest)),remainingInterest=cfRound(interest-towardInterest),remainingPrincipal=cfRound(principal-towardPrincipal),newDue=cfAddDays(date,30);const nextInterest=cfInterest(remainingPrincipal,rate,30,rule);const nextTotal=cfRound(remainingPrincipal+remainingInterest+nextInterest);const c=clients.find(x=>x.id===loan.client_id);cfQuoteText=`CrediFácil — Previsão de pagamento\nCliente: ${c?.nome||''}\nData: ${cfDate(date)}\nValor previsto na data: ${money(total)}\nPagamento informado: ${money(amount)}\nJuros abatidos: ${money(towardInterest)}\nPrincipal abatido: ${money(towardPrincipal)}\nPrincipal restante: ${money(remainingPrincipal)}\nJuros pendentes: ${money(remainingInterest)}\nPróximo vencimento proposto: ${cfDate(newDue)}\nTotal projetado para o próximo vencimento: ${money(nextTotal)}\nPrévia sujeita à validação contratual e jurídica. Não é recibo.`;$('q_result').innerHTML=`<h3>Previsão para ${cfDate(date)}</h3><p>Valor calculado na data: <strong>${money(total)}</strong></p><p>Juros na data: ${money(interest)}</p><p>Pagamento previsto: ${money(amount)}</p><p>Dos quais juros: ${money(towardInterest)} · Principal: ${money(towardPrincipal)}</p><p>Principal restante: <strong>${money(remainingPrincipal)}</strong></p><p>Juros não pagos: ${money(remainingInterest)}</p><p>Novo vencimento proposto: <strong>${cfDate(newDue)}</strong></p><p>Total projetado nessa data: <strong>${money(nextTotal)}</strong></p><p class="small">Cálculo de previsão. Nenhuma alteração foi feita no banco ou no capital. A data inicial foi estimada como 30 dias antes do primeiro vencimento.</p>`;}catch(e){cfQuoteText='';msg(e.message,true)}};
+// A data inicial é a contratação registrada no banco, nunca uma data deduzida do vencimento.
+function cfQuoteCompute(autoAmount=false){
+ const loan=loans.find(l=>l.id===$('q_loan').value);
+ if(!loan)throw Error('Selecione um empréstimo.');
+ const sim=simulations.find(s=>s.id===loan.simulation_id);
+ if(!sim)throw Error('Simulação original não encontrada.');
+ if(Number(sim.period_count)!==1)throw Error('A previsão por data está disponível para empréstimos de pagamento único.');
+ const date=$('q_date').value;if(!date)throw Error('Informe a data.');
+ const start=(loan.created_at||'').slice(0,10);
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(start))throw Error('A contratação não possui data registrada.');
+ const days=cfDays(start,date);if(days<0)throw Error('A data é anterior à contratação ('+cfDate(start)+').');
+ const due=sim.first_due, overdueDays=Math.max(0,cfDays(due,date));
+ const rate=Number(sim.monthly_rate),principal=Number(sim.principal),rule=$('q_rule').value;
+ if(!Number.isFinite(rate)||!Number.isFinite(principal)||principal<=0)throw Error('Dados financeiros inválidos.');
+ const paid=payments.filter(p=>p.loan_id===loan.id).reduce((t,p)=>t+Number(p.amount),0);
+ if(paid>0)throw Error('Esta operação já possui recebimentos. O recálculo após pagamentos anteriores exige apuração do saldo no banco.');
+ // Antecipação: dias corridos desde a contratação. Atraso: dias depois do vencimento.
+ const contractedDays=Math.max(1,cfDays(start,due));
+ const elapsed=Math.min(days,contractedDays);
+ const baseInterest=cfInterest(principal,rate,Math.min(elapsed,30),rule);
+ const dueTotal=cfRound(principal+cfInterest(principal,rate,Math.min(contractedDays,30),rule));
+ const overdue=overdueDays?cfRound(dueTotal*rate/100*overdueDays/30):0;
+ const interest=cfRound(baseInterest+overdue),total=cfRound(principal+interest);
+ if(autoAmount)$('q_amount').value=total.toFixed(2);
+ const raw=$('q_amount').value.trim().replace(',','.');
+ const amount=raw===''?total:Number(raw);
+ if(!Number.isFinite(amount)||amount<0||amount>total+0.001)throw Error('O pagamento deve estar entre R$ 0,00 e '+money(total)+' para a data escolhida.');
+ const towardInterest=cfRound(Math.min(amount,interest)),towardPrincipal=cfRound(Math.max(0,amount-towardInterest));
+ const remainingInterest=cfRound(interest-towardInterest),remainingPrincipal=cfRound(principal-towardPrincipal);
+ const newDue=cfAddDays(date,30),nextInterest=cfInterest(remainingPrincipal,rate,30,rule);
+ const nextTotal=cfRound(remainingPrincipal+remainingInterest+nextInterest);
+ const c=clients.find(x=>x.id===loan.client_id);
+ cfQuoteText=`CrediFácil — Previsão de pagamento\nCliente: ${c?.nome||''}\nContratação: ${cfDate(start)}\nPagamento: ${cfDate(date)} (${days} dias decorridos)\nValor na data: ${money(total)}\nPagamento informado: ${money(amount)}\nJuros quitados: ${money(towardInterest)}\nPrincipal amortizado: ${money(towardPrincipal)}\nPrincipal restante: ${money(remainingPrincipal)}\nJuros pendentes: ${money(remainingInterest)}\nPróximo vencimento proposto: ${cfDate(newDue)}\nTotal projetado: ${money(nextTotal)}\nPrevisão informativa, não é recibo.`;
+ $('q_result').innerHTML=`<h3>Previsão para ${cfDate(date)}</h3><p>Contratação: <strong>${cfDate(start)}</strong> · ${days} dia(s) decorridos</p><p>Vencimento original: ${cfDate(due)}</p><p>Regra aplicada: <strong>${esc($('q_rule').selectedOptions[0]?.textContent||rule)}</strong></p><p>Juros na data: <strong>${money(interest)}</strong></p><p>Valor para quitação nessa data: <strong>${money(total)}</strong></p><p>Pagamento informado: ${money(amount)}</p><p>Abatimento de juros: ${money(towardInterest)} · Principal: ${money(towardPrincipal)}</p><p>Principal restante: <strong>${money(remainingPrincipal)}</strong></p><p>Juros pendentes: ${money(remainingInterest)}</p>${amount<total?`<p>Novo vencimento proposto: <strong>${cfDate(newDue)}</strong></p><p>Total projetado para esse vencimento: <strong>${money(nextTotal)}</strong></p>`:'<p><strong>Quitação integral prevista.</strong></p>'}<p class="small">Prévia apenas. Nenhuma alteração foi feita no Supabase ou no capital. Confira a validade contratual e legal dos encargos.</p>`;
+}
+$('q_calculate').onclick=()=>{try{cfQuoteCompute(false)}catch(e){cfQuoteText='';msg(e.message,true)}};
+// Ao mudar a data, atualiza o valor sugerido de quitação; o usuário pode editar para pagar parcialmente.
+$('q_date').addEventListener('change',()=>{try{if($('q_loan').value)cfQuoteCompute(true)}catch(e){cfQuoteText='';msg(e.message,true)}});
+$('q_loan').addEventListener('change',()=>{try{if($('q_loan').value&&$('q_date').value)cfQuoteCompute(true)}catch(e){cfQuoteText='';msg(e.message,true)}});
+$('q_rule').addEventListener('change',()=>{try{if($('q_loan').value&&$('q_date').value)cfQuoteCompute(true)}catch(e){cfQuoteText='';msg(e.message,true)}});
 $('q_share').onclick=async()=>{if(!cfQuoteText){msg('Calcule a previsão primeiro.',true);return}try{if(navigator.share)await navigator.share({text:cfQuoteText});else if(navigator.clipboard){await navigator.clipboard.writeText(cfQuoteText);msg('Previsão copiada.')}else msg(cfQuoteText)}catch(e){if(e.name!=='AbortError')msg(e.message,true)}};
 
 // Etapa 4: contratação real a partir da simulação, confirmada pelo usuário.
